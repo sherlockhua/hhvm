@@ -305,6 +305,8 @@ ArgGroup CodeGenerator::argGroup(const IRInstruction* inst) const {
 }
 
 void CodeGenerator::cgInst(IRInstruction* inst) {
+  SCOPE_ASSERT_DETAIL("cgInst") { return inst->toString(); };
+
   switch (inst->op()) {
 #define O(name, dsts, srcs, flags)                                \
     case name: FTRACE(7, "cg" #name "\n");                        \
@@ -339,8 +341,6 @@ NOOP_OPCODE(DefConst)
 NOOP_OPCODE(DefFP)
 NOOP_OPCODE(AssertLoc)
 NOOP_OPCODE(Nop)
-NOOP_OPCODE(TakeStk)
-NOOP_OPCODE(TakeRef)
 NOOP_OPCODE(EndGuards)
 NOOP_OPCODE(HintLocInner)
 NOOP_OPCODE(HintStkInner)
@@ -405,7 +405,6 @@ CALL_OPCODE(NewLikeArray)
 CALL_OPCODE(AllocPackedArray)
 CALL_OPCODE(Clone)
 CALL_OPCODE(AllocObj)
-CALL_OPCODE(CustomInstanceInit)
 CALL_OPCODE(InitProps)
 CALL_OPCODE(InitSProps)
 CALL_OPCODE(RegisterLiveObj)
@@ -2418,31 +2417,6 @@ void CodeGenerator::cgIncRefCtx(IRInstruction* inst) {
   ifThen(v, CC_Z, sf, [&](Vout& v) { emitIncRef(v, src); });
 }
 
-void CodeGenerator::cgDecRefThis(IRInstruction* inst) {
-  auto fpReg = srcLoc(inst, 0).reg();
-  auto& v = vmain();
-  auto rthis = v.makeReg(); // Load AR->m_this into rthis
-  v << load{fpReg[AROFF(m_this)], rthis};
-
-  auto decrefIfAvailable = [&](Vout& v) {
-    // Check if this is available and we're not in a static context instead
-    auto const sf = v.makeReg();
-    v << testbi{1, rthis, sf};
-    ifThen(v, CC_Z, sf, [&](Vout& v) {
-      cgDecRefStaticType(v, inst, TObj, rthis);
-    });
-  };
-
-  if (getFunc(inst->marker())->isPseudoMain()) {
-    // In pseudo-mains, emit check for presence of m_this
-    auto const sf = v.makeReg();
-    v << testq{rthis, rthis, sf};
-    ifThen(v, CC_NZ, sf, [&](Vout& v) { decrefIfAvailable(v); });
-  } else {
-    decrefIfAvailable(v);
-  }
-}
-
 void CodeGenerator::cgGenericRetDecRefs(IRInstruction* inst) {
   auto const rFp       = srcLoc(inst, 0).reg();
   auto const numLocals = getFunc(inst->marker())->numLocals();
@@ -2514,123 +2488,97 @@ bool CodeGenerator::decRefDestroyIsUnlikely(const IRInstruction* inst,
   return true;
 }
 
-//
-// Using the given dataReg, this method generates code that checks the static
-// bit out of dataReg, and emits a DecRef if needed.
-//
-// We've tried a variety of tweaks to this and found the current state of
-// things optimal, at least when the measurements were made:
-// - whether to load the count into a register (if one is available)
-// - whether to use if (!--count) release(); if we don't need a static check
-// - whether to skip using the register and just emit --count if we know
-//   its not static, and can't hit zero.
-//
-// Return value: the address to be patched if a RefCountedStaticValue check is
-//               emitted; NULL otherwise.
-//
-template <typename F> void
-CodeGenerator::cgCheckStaticBitAndDecRef(Vout& v, const IRInstruction* inst,
-                                         Vlabel done, Type type,
-                                         Vreg dataReg, F destroyImpl) {
-  always_assert(type.maybe(TCounted));
+/*
+ * We've tried a variety of tweaks to this and found the current state of
+ * things optimal, at least when measurements of the following factors were
+ * made:
+ *
+ * - whether to load the count into a register
+ *
+ * - whether to use if (!--count) release(); if we don't need a static check
+ *
+ * - whether to skip using the register and just emit --count if we know
+ *   its not static, and can't hit zero.
+ *
+ * The current scheme generates if (!--count) release() for types that cannot
+ * possibly be static.  For types that might be static, it generates a compare
+ * of the m_count field against 1, followed by two conditional branches on the
+ * same flags.  We make use of the invariant that count fields are never zero,
+ * and use a code sequence that looks like this:
+ *
+ *    cmpl $1, $FAST_REFCOUNT_OFFSET(%base)
+ *    je do_release  // call the destructor, usually in acold
+ *    jl skip_dec    // count < 1 implies it's static
+ *    decl $FAST_REFCOUNT_OFFSET(%base)
+ *  skip_dec:
+ *    // ....
+ */
+void CodeGenerator::decRefImpl(Vout& v, const IRInstruction* inst) {
+  auto const ty   = inst->src(0)->type();
+  auto const base = srcLoc(inst, 0).reg(0);
 
   OptDecRefProfile profile;
-  auto const unlikelyDestroy = decRefDestroyIsUnlikely(inst, profile, type);
+  auto const unlikelyDestroy = decRefDestroyIsUnlikely(inst, profile, ty);
 
-  emitIncStat(v, unlikelyDestroy ? Stats::TC_DecRef_Normal_Decl
-                                 : Stats::TC_DecRef_Likely_Decl);
-
-  Vreg sf;
-  auto destroy = [&](Vout& v) {
+  auto destroy = [&] (Vout& v) {
     emitIncStat(v, unlikelyDestroy ? Stats::TC_DecRef_Normal_Destroy :
                    Stats::TC_DecRef_Likely_Destroy);
     if (profile && profile->profiling()) {
       v << incwm{rVmTl[profile->handle() + offsetof(DecRefProfile, destroy)],
                  v.makeReg()};
     }
-    destroyImpl(v);
+
+    cgCallHelper(
+      v,
+      ty.isKnownDataType()
+        ? mcg->getDtorCall(ty.toDataType())
+        : CppCall::destruct(srcLoc(inst, 0).reg(1)),
+      kVoidDest,
+      SyncOptions::kSyncPoint,
+      argGroup(inst)
+        .reg(base)
+    );
   };
 
-  if (!type.maybe(TStatic)) {
-    sf = v.makeReg();
-    v << declm{dataReg[FAST_REFCOUNT_OFFSET], sf};
-    emitAssertFlagsNonNegative(v, sf);
+  emitIncStat(v, unlikelyDestroy ? Stats::TC_DecRef_Normal_Decl
+                                 : Stats::TC_DecRef_Likely_Decl);
+
+  if (!ty.maybe(TStatic)) {
+    auto const sf = emitDecRef(v, base);
     ifBlock(v, vcold(), CC_E, sf, destroy, unlikelyDestroy);
     return;
   }
 
-  auto static_check_and_decl = [&](Vout& v) {
-    auto next = v.makeBlock();
-    assertx(sf != InvalidReg);
-    v << jcc{CC_L, sf, {next, done}};
-    v = next;
-
-    // Decrement _count
-    sf = v.makeReg();
-    v << declm{dataReg[FAST_REFCOUNT_OFFSET], sf};
-    emitAssertFlagsNonNegative(v, sf);
-  };
-
-  sf = v.makeReg();
-  v << cmplim{1, dataReg[FAST_REFCOUNT_OFFSET], sf};
-  ifThenElse(v, vcold(), CC_E, sf, destroy, static_check_and_decl,
-             unlikelyDestroy);
-}
-
-//
-// Generates dec-ref of a typed value with statically known type.
-//
-void CodeGenerator::cgDecRefStaticType(Vout& v,
-                                       const IRInstruction* inst,
-                                       Type type, Vreg dataReg) {
-  assertx(type != TCell && type != TGen);
-  assertx(type.isKnownDataType());
-
-  if (!type.maybe(TCounted)) return;
-
-  auto done = v.makeBlock();
-  cgCheckStaticBitAndDecRef(v, inst, done, type, dataReg, [&] (Vout& v) {
-    cgCallHelper(v,
-                 mcg->getDtorCall(type.toDataType()),
-                 kVoidDest,
-                 SyncOptions::kSyncPoint,
-                 argGroup(inst)
-                 .reg(dataReg));
-  });
-  if (!v.closed()) v << jmp{done};
-  v = done;
+  auto const cmp1_sf = v.makeReg();
+  v << cmplim{1, base[FAST_REFCOUNT_OFFSET], cmp1_sf};
+  ifThenElse(
+    v, vcold(), CC_E, cmp1_sf,
+    destroy,
+    [&] (Vout& v) {
+      /*
+       * If it's not static, actually reduce the reference count.  This
+       * does another branch using the same status flags from the cmplim
+       * above.
+       */
+      ifThen(
+        v, CC_NL, cmp1_sf,
+        [&] (Vout& v) {
+          emitDecRef(v, base);
+        }
+      );
+    },
+    unlikelyDestroy
+  );
 }
 
 void CodeGenerator::cgDecRef(IRInstruction *inst) {
-  auto const ty   = inst->src(0)->type();
-  auto const base = srcLoc(inst, 0).reg(0);
-
-  auto& v = vmain();
-  auto const done = v.makeBlock();
-
+  auto const ty = inst->src(0)->type();
   ifRefCountedType(
-    v, ty, srcLoc(inst, 0),
+    vmain(), ty, srcLoc(inst, 0),
     [&] (Vout& v) {
-      cgCheckStaticBitAndDecRef(
-        v, inst, done, ty,
-        base,
-        [&] (Vout& v) {
-          cgCallHelper(
-            v,
-            ty.isKnownDataType()
-              ? mcg->getDtorCall(ty.toDataType())
-              : CppCall::destruct(srcLoc(inst, 0).reg(1)),
-            kVoidDest,
-            SyncOptions::kSyncPoint,
-            argGroup(inst)
-              .reg(base)
-          );
-        }
-      );
+      decRefImpl(v, inst);
     }
   );
-  if (!v.closed()) v << jmp{done};
-  v = done;
 }
 
 void CodeGenerator::cgDecRefNZ(IRInstruction* inst) {
@@ -3395,7 +3343,7 @@ void CodeGenerator::emitStoreTypedValue(Vptr dst, SSATmp* src, Vloc loc) {
     // Whole typed value is stored in single SIMD reg srcReg0
     assertx(RuntimeOption::EvalHHIRAllocSIMDRegs);
     assertx(!srcReg1.isValid());
-    v << storedqu{srcReg0, refTVData(dst)};
+    v << storeups{srcReg0, refTVData(dst)};
     return;
   }
 
@@ -3452,7 +3400,7 @@ void CodeGenerator::emitLoadTypedValue(SSATmp* dst, Vloc dstLoc, Vptr ref) {
   auto& v = vmain();
   if (dstLoc.isFullSIMD()) {
     // Whole typed value is stored in single SIMD reg valueDstReg
-    v << loaddqu{refTVData(ref), valueDstReg};
+    v << loadups{refTVData(ref), valueDstReg};
     return;
   }
   auto const typeDstReg = dstLoc.reg(1);
@@ -5488,8 +5436,8 @@ void CodeGenerator::cgInitPackedArrayLoop(IRInstruction* inst) {
   // Load the value from the stack and store into the array. It's safe
   // to copy all 16 bytes of the value because packed arrays don't use
   // The TypedValueAux::m_aux field.
-  v << loaddqu{sp[j1 * 8], value};
-  v << storedqu{value, arrReg[i1 * 8] + firstEntry};
+  v << loadups{sp[j1 * 8], value};
+  v << storeups{value, arrReg[i1 * 8] + firstEntry};
   // Increment the loop variable by 2 because we can only scale by at most 8.
   v << lea{i1[2], i2};
   auto subFlags = v.makeReg();

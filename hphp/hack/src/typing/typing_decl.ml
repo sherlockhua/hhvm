@@ -739,20 +739,10 @@ and typeconst_decl c (env, acc) {
       env, acc
 
 and method_decl env m =
-  (* XXX: this is a dependency on the function body to get declaration info *)
-
   let env, arity_min, params = Typing.make_params env true 0 m.m_params in
-  let named_body = Nast.assert_named_body m.m_body in
-  let env, ret =
-    match m.m_ret, named_body.fnb_fun_kind with
-      | None, FGenerator
-      | None, FAsyncGenerator
-      | None, FSync -> env, (Reason.Rwitness (fst m.m_name), Tany)
-      | None, FAsync ->
-        let pos = fst m.m_name in
-        env, (Reason.Rasync_ret pos,
-              Tapply ((pos, SN.Classes.cAwaitable), [(Reason.Rwitness pos, Tany)]))
-      | Some ret, _ -> Typing_hint.hint env ret in
+  let env, ret = match m.m_ret with
+    | None -> env, Typing.ret_from_fun_kind (fst m.m_name) m.m_fun_kind
+    | Some ret -> Typing_hint.hint env ret in
   let env, arity = match m.m_variadic with
     | FVvariadicArg param ->
       assert param.param_is_variadic;

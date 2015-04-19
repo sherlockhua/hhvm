@@ -159,7 +159,6 @@ bool canDCE(IRInstruction* inst) {
   case DefInlineFP:
   case LdRetAddr:
   case Mov:
-  case TakeRef:
   case ReDefSP:
   case CountArray:
   case CountArrayFast:
@@ -252,7 +251,6 @@ bool canDCE(IRInstruction* inst) {
   case Jmp:
   case DefLabel:
   case Box:
-  case TakeStk:
   case LdLocPseudoMain:
   case LdVectorBase:
   case LdPairBase:
@@ -288,7 +286,6 @@ bool canDCE(IRInstruction* inst) {
   case InitSProps:
   case InitObjProps:
   case ConstructInstance:
-  case CustomInstanceInit:
   case AllocPackedArray:
   case InitPackedArray:
   case InitPackedArrayLoop:
@@ -317,7 +314,6 @@ bool canDCE(IRInstruction* inst) {
   case ReqRetranslateOpt:
   case IncRef:
   case IncRefCtx:
-  case DecRefThis:
   case DecRef:
   case DecRefNZ:
   case DefFP:

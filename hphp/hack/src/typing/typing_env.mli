@@ -98,17 +98,15 @@ val get_todo : env -> tfun list
 val get_return : env -> ty
 val set_return : env -> ty -> env
 val with_return : env -> (env -> env) -> env
-val allow_null_as_void : env -> bool
 val is_static : env -> bool
 val grow_super : env -> bool
 val get_self : env -> ty
 val get_self_id : env -> string
 val get_parent : env -> ty
-val get_fn_kind : env -> Nast.fun_kind
+val get_fn_kind : env -> Ast.fun_kind
 val get_file : env -> Relative_path.t
 val get_fun : env -> Funs.key -> Funs.t option
-val set_allow_null_as_void : ?allow:bool -> env -> env
-val set_fn_kind : env -> Nast.fun_kind -> env
+val set_fn_kind : env -> Ast.fun_kind -> env
 val add_todo : env -> tfun -> env
 val add_anonymous : env -> anon -> env * int
 val get_anonymous : env -> int -> anon option

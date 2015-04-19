@@ -96,8 +96,7 @@ and genv = {
   self_id : string     ;
   self    : ty         ;
   static  : bool       ;
-  allow_null_as_void : bool;
-  fun_kind : Nast.fun_kind;
+  fun_kind : Ast.fun_kind;
   anons   : anon IMap.t;
   droot   : Typing_deps.Dep.variant option  ;
   file    : Relative_path.t;
@@ -287,8 +286,7 @@ let empty tcopt file = {
     self    = Reason.none, Tany;
     static  = false;
     parent  = Reason.none, Tany;
-    allow_null_as_void = false;
-    fun_kind = FSync;
+    fun_kind = Ast.FSync;
     anons   = IMap.empty;
     droot   = None;
     file    = file;
@@ -336,7 +334,6 @@ let add_wclass env x =
 (* When we want to type something with a fresh typing environment *)
 let fresh_tenv env f =
   let genv = env.genv in
-  let genv = { genv with allow_null_as_void = false } in
   f { env with todo = []; tenv = IMap.empty; genv = genv; in_loop = false }
 
 let get_class env x =
@@ -437,7 +434,6 @@ let with_return env f =
   let env = f env in
   set_return env ret
 
-let allow_null_as_void env = env.genv.allow_null_as_void
 let is_static env = env.genv.static
 let get_self env = env.genv.self
 let get_self_id env = env.genv.self_id
@@ -451,11 +447,6 @@ let get_fun env x =
   let dep = Dep.Fun x in
   Typing_deps.add_idep env.genv.droot dep;
   Funs.get x
-
-let set_allow_null_as_void ?(allow=true) env =
-  let genv = env.genv in
-  let genv = { genv with allow_null_as_void = allow } in
-  { env with genv = genv }
 
 let set_fn_kind env fn_type =
   let genv = env.genv in

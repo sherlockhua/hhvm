@@ -1360,16 +1360,7 @@ void find_alias_sets(Env& env) {
       return;
     }
 
-    // TODO(#6317780): CastCtxThis should be passthrough, but it breaks
-    // the old refcount-opts.cpp, so work around it here for now.
-    auto const canon = [&] () -> SSATmp* {
-      auto ret = canonical(tmp);
-      while (ret->inst()->is(CastCtxThis)) {
-        ret = canonical(ret->inst()->src(0));
-      }
-      return ret;
-    }();
-
+    auto const canon = canonical(tmp);
     if (env.asetMap[canon] != -1) {
       id = env.asetMap[canon];
     } else {
@@ -1953,9 +1944,9 @@ void pure_spill_frame(Env& env,
    * If the frame becomes live via DefInlineFP, we don't need to treat it as
    * memory support for this set anymore, for the same reason that LdCtx
    * doesn't need that.  The only way that reference can be DecRef'd in a
-   * semantically correct program is in a return sequence, which will contain
-   * either a DecRef or DecRefThis (or unwinding), and if it's done inside this
-   * region, we will see the instructions and handle that.
+   * semantically correct program is in a return sequence, and if it's done
+   * inside this region, we will see the relevant DecRef instructions and
+   * handle that.
    */
   create_store_support(env, state, psf.ctx, ctx, add_node);
 }
@@ -2080,9 +2071,6 @@ void rc_analyze_inst(Env& env,
       ++aset.lower_bound;
       FTRACE(3, "    {} lb: {}\n", asetID, aset.lower_bound);
     });
-    return;
-  case DecRefThis:
-    pessimize_all(env, state, add_node);
     return;
   case DecRef:
   case DecRefNZ:
@@ -3333,8 +3321,10 @@ void rcgraph_opts(Env& env) {
 
 }
 
+//////////////////////////////////////////////////////////////////////
+
 void optimizeRefcounts2(IRUnit& unit) {
-  Timer timer(Timer::optimize_refcountOpts2);
+  Timer timer(Timer::optimize_refcountOpts);
   splitCriticalEdges(unit);
 
   PassTracer tracer{&unit, Trace::hhir_refcount, "optimizeRefcounts"};
